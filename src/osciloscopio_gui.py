@@ -26,11 +26,69 @@ from matplotlib.figure import Figure
 from matplotlib.widgets import SubplotTool
 import matplotlib.ticker as ticker
 
-try:
-    from tkinterdnd2 import TkDnD, DND_FILES
-    DND_AVAILABLE = True
-except ImportError:
-    DND_AVAILABLE = False
+# ─────────────────────────────────────────────
+#  Drag & Drop — backend segun plataforma
+#  Windows : ctypes nativo (WM_DROPFILES)
+#  Linux   : tkinterdnd2
+# ─────────────────────────────────────────────
+import sys
+import urllib.parse
+
+DND_BACKEND = None   # "windows" | "tkinterdnd2" | None
+
+if sys.platform == "win32":
+    try:
+        import ctypes, ctypes.wintypes
+        DND_BACKEND = "windows"
+    except Exception:
+        DND_BACKEND = None
+else:
+    try:
+        from tkinterdnd2 import TkDnD, DND_FILES
+        DND_BACKEND = "tkinterdnd2"
+    except Exception:
+        DND_BACKEND = None
+
+DND_AVAILABLE = DND_BACKEND is not None
+
+# ── Implementacion Windows: WM_DROPFILES via ctypes ──────────────────────────
+if sys.platform == "win32":
+    _WM_DROPFILES  = 0x0233
+    _GWL_WNDPROC   = -4
+    _WNDPROCTYPE   = ctypes.WINFUNCTYPE(
+        ctypes.c_long, ctypes.wintypes.HWND,
+        ctypes.c_uint, ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM)
+    _dnd_cb        = None   # evitar GC
+    _old_wndproc   = None
+
+    def _win_enable_drop(hwnd, callback):
+        global _dnd_cb, _old_wndproc
+        ctypes.windll.shell32.DragAcceptFiles(hwnd, True)
+        try:
+            ctypes.windll.user32.ChangeWindowMessageFilterEx(
+                hwnd, _WM_DROPFILES, 1, None)
+        except Exception:
+            pass
+
+        def _wndproc(hwnd, msg, wparam, lparam):
+            if msg == _WM_DROPFILES:
+                hdrop = wparam
+                count = ctypes.windll.shell32.DragQueryFileW(
+                    hdrop, 0xFFFFFFFF, None, 0)
+                paths = []
+                buf = ctypes.create_unicode_buffer(260)
+                for i in range(count):
+                    ctypes.windll.shell32.DragQueryFileW(hdrop, i, buf, 260)
+                    paths.append(buf.value)
+                ctypes.windll.shell32.DragFinish(hdrop)
+                callback(paths)
+                return 0
+            return ctypes.windll.user32.CallWindowProcW(
+                _old_wndproc, hwnd, msg, wparam, lparam)
+
+        _dnd_cb      = _WNDPROCTYPE(_wndproc)
+        _old_wndproc = ctypes.windll.user32.SetWindowLongPtrW(
+            hwnd, _GWL_WNDPROC, _dnd_cb)
 
 try:
     import ltspice
@@ -139,15 +197,30 @@ def load_ltspice(path):
     l = ltspice.Ltspice(path)
     l.parse()
 
-    time = l.get_time()
-    if time is not None and len(time) > 0:
+    # get_time() lanza InvalidPhysicalValueRequestedException en simulaciones AC
+    # get_frequency() lanza lo mismo en simulaciones transient → usar try/except en ambos
+    time = None
+    try:
+        t = l.get_time()
+        if t is not None and len(t) > 0:
+            time = t
+    except Exception:
+        pass
+
+    freq = None
+    try:
+        f = l.get_frequency()
+        if f is not None and len(f) > 0:
+            freq = f
+    except Exception:
+        pass
+
+    if time is not None:
         x_data, x_name, x_unit, is_ac = np.array(time, dtype=float), "time [second]", "second", False
+    elif freq is not None:
+        x_data, x_name, x_unit, is_ac = np.array(freq, dtype=float), "frequency [hz]", "hz", True
     else:
-        freq = l.get_frequency()
-        if freq is not None and len(freq) > 0:
-            x_data, x_name, x_unit, is_ac = np.array(freq, dtype=float), "frequency [hz]", "hz", True
-        else:
-            raise ValueError("No se encontro eje temporal ni de frecuencia.")
+        raise ValueError("No se encontro eje temporal ni de frecuencia.")
 
     variables = None
     for attr in ("variables", "_variables", "get_variable_names"):
@@ -218,16 +291,15 @@ class Layer:
 
 class FixedToolbar(NavigationToolbar2Tk):
     """
-    Toolbar que sobreescribe 'home' para restaurar exactamente
-    los limites calculados al graficar, no los limites de matplotlib
-    que pueden incluir padding extra.
+    Toolbar que:
+    - Sobreescribe 'home' para restaurar limites exactos del ultimo replot.
+    - Sobreescribe 'configure_subplots' para abrir nuestra ventana con entradas numericas.
     """
     def __init__(self, canvas, parent, app):
         self._app = app
         super().__init__(canvas, parent)
 
     def home(self, *args):
-        """Restaura los limites guardados justo despues del ultimo replot."""
         lims = getattr(self._app, "_home_limits", None)
         if lims:
             xmin, xmax, ymin, ymax = lims
@@ -236,6 +308,9 @@ class FixedToolbar(NavigationToolbar2Tk):
             self._app.canvas.draw()
         else:
             super().home(*args)
+
+    def configure_subplots(self, *args):
+        self._app._open_subplot_config()
 
 
 # ─────────────────────────────────────────────
@@ -437,9 +512,6 @@ class OsciloscopioApp:
         ttk.Button(f, text="Borrar todos los archivos",
                    command=self._clear_all).grid(row=2, column=0, columnspan=2,
                                                   padx=4, pady=(0,6), sticky="ew")
-        dnd_row = 3 if LTSPICE_AVAILABLE else 4
-        ttk.Label(f, text="(arrastra archivos .csv / .raw aqui)").grid(
-            row=dnd_row, column=0, columnspan=2, pady=(0,4))
 
         # ── Titulos ──
         f = self._lf(p, "TITULOS", 1)
@@ -555,11 +627,6 @@ class OsciloscopioApp:
         self.toolbar = FixedToolbar(self.canvas, tb_frame, app=self)
         self.toolbar.update()
 
-        # Reemplazar el boton "Configure subplots" de la toolbar por el nuestro
-        # Lo hacemos agregando nuestro boton separado
-        ttk.Button(tb_frame, text="Margenes...",
-                   command=self._open_subplot_config).pack(side="left", padx=2)
-
         self._draw_welcome()
 
     def _draw_welcome(self):
@@ -582,21 +649,68 @@ class OsciloscopioApp:
     # ─── Drag & drop ───────────────────────────
 
     def _setup_dnd(self):
-        # Registrar DnD en la ventana principal y en el canvas
-        if DND_AVAILABLE:
-            self.root.drop_target_register(DND_FILES)
-            self.root.dnd_bind("<<Drop>>", self._on_drop)
+        if not DND_AVAILABLE:
+            return
+        if DND_BACKEND == "windows":
+            # Esperar a que la ventana tenga HWND asignado
+            self.root.after(300, self._setup_dnd_windows)
         else:
-            # Sin tkinterdnd2: vincular eventos nativos de X11 no es posible facilmente,
-            # pero al menos el mensaje indica que se puede arrastar
-            pass
+            # Linux: tkinterdnd2 — registrar recursivamente tras render
+            self.root.after(200, self._register_dnd_tkinterdnd2)
 
-    def _on_drop(self, event):
-        raw = event.data.strip()
-        paths = re.findall(r'\{([^}]+)\}|(\S+)', raw)
-        paths = [a or b for a, b in paths]
+    def _setup_dnd_windows(self):
+        """Habilita WM_DROPFILES nativo en Windows via ctypes."""
+        try:
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            if hwnd == 0:
+                hwnd = self.root.winfo_id()
+            _win_enable_drop(hwnd, self._on_drop_paths)
+        except Exception as e:
+            print(f"[DnD Windows] Error: {e}")
+
+    def _register_dnd_tkinterdnd2(self):
+        """Registra DnD en todos los widgets (Linux via tkinterdnd2)."""
+        def register(widget):
+            try:
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind("<<Drop>>", self._on_drop_event)
+            except Exception:
+                pass
+            for child in widget.winfo_children():
+                register(child)
+        register(self.root)
+
+    def _on_drop_paths(self, paths):
+        """Callback para Windows: recibe lista de paths ya limpios."""
         for path in paths:
             self._dispatch_file(path)
+
+    def _on_drop_event(self, event):
+        """Callback para Linux/tkinterdnd2: parsea event.data."""
+        raw = event.data.strip()
+        # Linux puede entregar: file:///ruta  o  {ruta con espacios}
+        if raw.startswith("file://"):
+            parts = re.split(r'\s+', raw)
+        else:
+            parts_raw = re.findall(r'\{([^}]+)\}|(\S+)', raw)
+            parts = [a or b for a, b in parts_raw]
+        for part in parts:
+            path = self._clean_drop_path(part)
+            if path:
+                self._dispatch_file(path)
+
+    @staticmethod
+    def _clean_drop_path(path):
+        """Normaliza un path de drag & drop en Linux."""
+        path = path.strip()
+        if not path:
+            return None
+        if path.startswith("file:///"):
+            path = path[7:]
+        elif path.startswith("file://"):
+            path = path[7:]
+        path = urllib.parse.unquote(path)
+        return os.path.normpath(path)
 
     def _dispatch_file(self, path):
         ext = os.path.splitext(path)[1].lower()
@@ -669,6 +783,9 @@ class OsciloscopioApp:
         self._rebuild_layers_panel()
         self._update_xy_combos()
         self._replot()
+        # Re-registrar DnD en nuevos widgets (solo Linux/tkinterdnd2)
+        if DND_BACKEND == "tkinterdnd2":
+            self.root.after(50, self._register_dnd_tkinterdnd2)
 
     def _clear_all(self):
         self.layers.clear()
@@ -837,7 +954,12 @@ class OsciloscopioApp:
         self.fig.patch.set_facecolor("#1a1a2e")
         for spine in self.ax.spines.values():
             spine.set_color("#333366")
-        self.ax.tick_params(colors="#aaaacc", labelsize=8)
+        # Forzar color gris en todos los tick labels (fix para Linux donde
+        # algunos ticks quedan negros tras ax.clear())
+        self.ax.tick_params(axis='both', colors="#aaaacc", labelsize=8,
+                            which='both', labelcolor="#aaaacc")
+        self.ax.xaxis.label.set_color("#8888aa")
+        self.ax.yaxis.label.set_color("#8888aa")
 
         if self.var_xy.get():
             self._plot_xy()
@@ -1009,7 +1131,9 @@ class OsciloscopioApp:
 # ─────────────────────────────────────────────
 
 def main():
-    if DND_AVAILABLE:
+    # Windows: usar tk.Tk() normal; el DnD lo maneja ctypes directamente
+    # Linux:   usar TkDnD() si tkinterdnd2 esta disponible
+    if DND_BACKEND == "tkinterdnd2":
         root = TkDnD()
     else:
         root = tk.Tk()
