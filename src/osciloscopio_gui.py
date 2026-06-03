@@ -53,47 +53,76 @@ DND_AVAILABLE = DND_BACKEND is not None
 
 # ── Implementacion Windows: WM_DROPFILES via ctypes ──────────────────────────
 if sys.platform == "win32":
-    _WM_DROPFILES  = 0x0233
-    _GWL_WNDPROC   = -4
-    _WNDPROCTYPE   = ctypes.WINFUNCTYPE(
-        ctypes.c_long, ctypes.wintypes.HWND,
-        ctypes.c_uint, ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM)
-    _dnd_cb        = None   # evitar GC
-    _old_wndproc   = None
+    _WM_DROPFILES = 0x0233
+    _GWL_WNDPROC  = -4
+
+    # En 32-bit los punteros son 4 bytes; en 64-bit son 8 bytes.
+    # WNDPROC siempre usa c_long como retorno en ambas arquitecturas.
+    _WNDPROCTYPE = ctypes.WINFUNCTYPE(
+        ctypes.c_long,
+        ctypes.wintypes.HWND,
+        ctypes.c_uint,
+        ctypes.wintypes.WPARAM,
+        ctypes.wintypes.LPARAM,
+    )
+
+    # Setear tipos de retorno correctos para las funciones que usamos
+    ctypes.windll.shell32.DragQueryFileW.restype  = ctypes.c_uint
+    ctypes.windll.shell32.DragAcceptFiles.restype = None
+    ctypes.windll.shell32.DragFinish.restype      = None
+
+    _dnd_cb      = None   # referencia global para evitar GC
+    _old_wndproc = None
 
     def _win_enable_drop(hwnd, callback):
         global _dnd_cb, _old_wndproc
+
+        # Habilitar drops en la ventana
         ctypes.windll.shell32.DragAcceptFiles(hwnd, True)
+
+        # En Windows Vista+ con UAC, necesitamos esto para recibir
+        # WM_DROPFILES desde procesos de menor privilegio (Explorer)
         try:
+            # MSGFLT_ALLOW = 1
             ctypes.windll.user32.ChangeWindowMessageFilterEx(
                 hwnd, _WM_DROPFILES, 1, None)
+            # Tambien necesitamos habilitar WM_COPYDATA (0x004A)
+            # que a veces viene junto
+            ctypes.windll.user32.ChangeWindowMessageFilterEx(
+                hwnd, 0x0049, 1, None)  # WM_COPYGLOBALDATA
         except Exception:
             pass
 
-        def _wndproc(hwnd, msg, wparam, lparam):
+        def _wndproc(h, msg, wparam, lparam):
             if msg == _WM_DROPFILES:
-                hdrop = wparam
+                hdrop = ctypes.wintypes.HANDLE(wparam)
+                # Obtener cantidad de archivos
                 count = ctypes.windll.shell32.DragQueryFileW(
                     hdrop, 0xFFFFFFFF, None, 0)
                 paths = []
-                buf = ctypes.create_unicode_buffer(260)
+                buf = ctypes.create_unicode_buffer(4096)
                 for i in range(count):
-                    ctypes.windll.shell32.DragQueryFileW(hdrop, i, buf, 260)
+                    ctypes.windll.shell32.DragQueryFileW(
+                        hdrop, i, buf, ctypes.sizeof(buf) // 2)
                     paths.append(buf.value)
                 ctypes.windll.shell32.DragFinish(hdrop)
+                # Llamar callback en el hilo principal de Tk
                 callback(paths)
                 return 0
+            # Pasar al wndproc original
             return ctypes.windll.user32.CallWindowProcW(
-                _old_wndproc, hwnd, msg, wparam, lparam)
+                _old_wndproc, h, msg, wparam, lparam)
 
         _dnd_cb = _WNDPROCTYPE(_wndproc)
-        # SetWindowLongPtrW solo existe en Python 64-bit;
-        # en Python 32-bit usar SetWindowLongW
+
+        # Seleccionar SetWindowLong segun arquitectura
         try:
-            _set_wndproc = ctypes.windll.user32.SetWindowLongPtrW
+            _SetWL = ctypes.windll.user32.SetWindowLongPtrW
         except AttributeError:
-            _set_wndproc = ctypes.windll.user32.SetWindowLongW
-        _old_wndproc = _set_wndproc(hwnd, _GWL_WNDPROC, _dnd_cb)
+            _SetWL = ctypes.windll.user32.SetWindowLongW
+
+        _SetWL.restype = ctypes.c_long
+        _old_wndproc = _SetWL(hwnd, _GWL_WNDPROC, _dnd_cb)
 
 try:
     import ltspice
@@ -759,10 +788,18 @@ class OsciloscopioApp:
     def _setup_dnd_windows(self):
         """Habilita WM_DROPFILES nativo en Windows via ctypes."""
         try:
-            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-            if hwnd == 0:
+            # Buscar el HWND real de la ventana por su titulo.
+            # winfo_id() en Python 32-bit no devuelve el HWND correcto,
+            # FindWindowW es la forma mas robusta.
+            title = self.root.title()
+            hwnd = ctypes.windll.user32.FindWindowW(None, title)
+            if not hwnd:
+                # fallback: intentar con winfo_id directo
                 hwnd = self.root.winfo_id()
-            _win_enable_drop(hwnd, self._on_drop_paths)
+            if hwnd:
+                _win_enable_drop(hwnd, self._on_drop_paths)
+            else:
+                print("[DnD Windows] No se pudo obtener el HWND de la ventana.")
         except Exception as e:
             print(f"[DnD Windows] Error: {e}")
 
