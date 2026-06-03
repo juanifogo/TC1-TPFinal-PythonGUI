@@ -1054,10 +1054,14 @@ class OsciloscopioApp:
             pairs = [(h, l) for h, l in zip(handles, labels) if not l.startswith("_")]
             if pairs:
                 hs, ls = zip(*pairs)
-                self.ax.legend(hs, ls,
-                               loc=self.cmb_legend_loc.get(),
-                               facecolor="#111130", edgecolor="#3333aa",
-                               labelcolor="#ddddff", fontsize=7)
+                leg = self.ax.legend(hs, ls,
+                                     loc=self.cmb_legend_loc.get(),
+                                     facecolor="#111130", edgecolor="#3333aa",
+                                     fontsize=7)
+                # labelcolor se agrego en matplotlib 3.3 — colorear manualmente
+                # para compatibilidad con versiones anteriores
+                for text in leg.get_texts():
+                    text.set_color("#ddddff")
 
         self._redraw_cursors()
 
