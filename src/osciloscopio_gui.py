@@ -86,9 +86,14 @@ if sys.platform == "win32":
             return ctypes.windll.user32.CallWindowProcW(
                 _old_wndproc, hwnd, msg, wparam, lparam)
 
-        _dnd_cb      = _WNDPROCTYPE(_wndproc)
-        _old_wndproc = ctypes.windll.user32.SetWindowLongPtrW(
-            hwnd, _GWL_WNDPROC, _dnd_cb)
+        _dnd_cb = _WNDPROCTYPE(_wndproc)
+        # SetWindowLongPtrW solo existe en Python 64-bit;
+        # en Python 32-bit usar SetWindowLongW
+        try:
+            _set_wndproc = ctypes.windll.user32.SetWindowLongPtrW
+        except AttributeError:
+            _set_wndproc = ctypes.windll.user32.SetWindowLongW
+        _old_wndproc = _set_wndproc(hwnd, _GWL_WNDPROC, _dnd_cb)
 
 try:
     import ltspice
@@ -284,6 +289,96 @@ class Layer:
         self.labels = [col.split("[")[0].strip() for col in self.y_cols]
         self.label_visible = [True] * n     # si aparece en la leyenda
 
+
+
+
+# ─────────────────────────────────────────────
+#  Clase FuncLayer — capa de funcion teorica
+# ─────────────────────────────────────────────
+
+class FuncLayer:
+    """
+    Capa que representa una funcion matematica introducida por el usuario.
+    El eje X se define por rango y numero de puntos.
+    Las constantes son variables editables que aparecen como sliders/entries.
+    """
+    def __init__(self, name, color_offset=0):
+        self.name          = name
+        self.visible       = True
+        self.is_freq       = False   # puede cambiarse con el checkbox
+        self.kind          = "func"  # distingue de Layer normal
+
+        # Expresion y rango
+        self.expr          = ""           # ej: "A * sin(2*pi*f*x)"
+        self.x_start       = "0"
+        self.x_end         = "1e-3"
+        self.n_points      = "1000"
+        self.x_log         = False        # generar puntos en escala log
+
+        # Constantes definidas por el usuario: [{name, value, min, max}]
+        self.constants     = []
+
+        # Propiedades de trazo (una sola curva por FuncLayer)
+        self.color         = COLORS[color_offset % len(COLORS)]
+        self.label         = name
+        self.label_visible = True
+        self.offset_y      = 0.0
+        self.offset_x      = 0.0
+        self.scale         = 1.0
+        self.linestyle     = "-"   # -, --, -., :
+
+    def evaluate(self):
+        """
+        Evalua la expresion y devuelve (x_data, y_data) o lanza ValueError.
+        El namespace incluye numpy y las constantes del usuario.
+        """
+        try:
+            n   = max(2, int(float(self.n_points)))
+            x0  = float(self.x_start)
+            x1  = float(self.x_end)
+            if x0 >= x1:
+                raise ValueError("X inicio debe ser menor que X fin.")
+            if self.x_log:
+                if x0 <= 0:
+                    raise ValueError("Para escala log X, X inicio debe ser > 0.")
+                x = np.logspace(np.log10(x0), np.log10(x1), n)
+            else:
+                x = np.linspace(x0, x1, n)
+        except Exception as e:
+            raise ValueError(f"Rango X invalido: {e}")
+
+        # Namespace con numpy y constantes del usuario
+        ns = {
+            # numpy
+            "np": np, "pi": np.pi, "e": np.e, "inf": np.inf,
+            "sin": np.sin, "cos": np.cos, "tan": np.tan,
+            "asin": np.arcsin, "acos": np.arccos, "atan": np.arctan,
+            "sinh": np.sinh, "cosh": np.cosh, "tanh": np.tanh,
+            "exp": np.exp, "log": np.log, "log10": np.log10, "log2": np.log2,
+            "sqrt": np.sqrt, "abs": np.abs, "sign": np.sign,
+            "floor": np.floor, "ceil": np.ceil,
+            "linspace": np.linspace, "logspace": np.logspace,
+            # variable independiente
+            "x": x,
+        }
+        # Constantes del usuario
+        for c in self.constants:
+            try:
+                ns[c["name"]] = float(c["value"])
+            except Exception:
+                pass
+
+        try:
+            y = eval(self.expr, {"__builtins__": {}}, ns)
+            y = np.asarray(y, dtype=float)
+            if y.shape == ():         # escalar -> broadcast
+                y = np.full_like(x, float(y))
+        except Exception as e:
+            raise ValueError(f"Error en la expresion: {e}")
+
+        y = y * self.scale + self.offset_y
+        x = x + self.offset_x
+        return x, y
 
 # ─────────────────────────────────────────────
 #  Toolbar personalizada con boton Home corregido
@@ -509,7 +604,10 @@ class OsciloscopioApp:
         if not LTSPICE_AVAILABLE:
             ttk.Label(f, text="(*) pip install ltspice",
                       foreground="#ff8800").grid(row=1, column=0, columnspan=2, padx=4, pady=(0,2))
-        ttk.Button(f, text="Borrar todos los archivos",
+        ttk.Button(f, text="+ Funcion teorica",
+                   command=self._add_func_layer).grid(row=1, column=0, columnspan=2,
+                                                       padx=4, pady=(0,4), sticky="ew")
+        ttk.Button(f, text="Borrar todos",
                    command=self._clear_all).grid(row=2, column=0, columnspan=2,
                                                   padx=4, pady=(0,6), sticky="ew")
 
@@ -787,6 +885,272 @@ class OsciloscopioApp:
         if DND_BACKEND == "tkinterdnd2":
             self.root.after(50, self._register_dnd_tkinterdnd2)
 
+
+    # ─── Funcion teorica ───────────────────────
+
+    def _add_func_layer(self):
+        """Crea una nueva capa de funcion teorica y la agrega."""
+        color_offset = sum(
+            (len(l.y_cols) if hasattr(l, "y_cols") else 1)
+            for l in self.layers
+        )
+        n = sum(1 for l in self.layers if hasattr(l, "kind") and l.kind == "func")
+        fl = FuncLayer(f"Funcion {n+1}", color_offset=color_offset)
+        self.layers.append(fl)
+        self._rebuild_layers_panel()
+        if DND_BACKEND == "tkinterdnd2":
+            self.root.after(50, self._register_dnd_tkinterdnd2)
+
+    def _build_func_channel_ui(self, fl, li):
+        """Construye los controles de una FuncLayer en el panel de capas."""
+
+        # ── Expresion ──
+        frm_expr = ttk.Frame(self.frm_layers)
+        frm_expr.pack(fill="x", padx=8, pady=2)
+        frm_expr.columnconfigure(1, weight=1)
+        ttk.Label(frm_expr, text="f(x) =").grid(row=0, column=0, sticky="w", padx=2)
+        var_expr = tk.StringVar(value=fl.expr)
+        def _set_expr(*a, flr=fl, v=var_expr):
+            flr.expr = v.get()
+        var_expr.trace_add("write", _set_expr)
+        ent_expr = ttk.Entry(frm_expr, textvariable=var_expr)
+        ent_expr.grid(row=0, column=1, sticky="ew", padx=2)
+        ent_expr.bind("<Return>",   lambda e: self._eval_and_replot(fl))
+        ent_expr.bind("<FocusOut>", lambda e: self._eval_and_replot(fl))
+
+        # ── Rango X ──
+        frm_range = ttk.Frame(self.frm_layers)
+        frm_range.pack(fill="x", padx=8, pady=1)
+        frm_range.columnconfigure(1, weight=1)
+        frm_range.columnconfigure(3, weight=1)
+        ttk.Label(frm_range, text="X:").grid(row=0, column=0, sticky="w", padx=2)
+        var_x0 = tk.StringVar(value=fl.x_start)
+        def _set_x0(*a, flr=fl, v=var_x0):
+            flr.x_start = v.get()
+        var_x0.trace_add("write", _set_x0)
+        ttk.Entry(frm_range, textvariable=var_x0, width=8).grid(
+            row=0, column=1, sticky="ew", padx=2)
+        ttk.Label(frm_range, text="a").grid(row=0, column=2, padx=2)
+        var_x1 = tk.StringVar(value=fl.x_end)
+        def _set_x1(*a, flr=fl, v=var_x1):
+            flr.x_end = v.get()
+        var_x1.trace_add("write", _set_x1)
+        ttk.Entry(frm_range, textvariable=var_x1, width=8).grid(
+            row=0, column=3, sticky="ew", padx=2)
+
+        # ── Puntos y log X ──
+        frm_pts = ttk.Frame(self.frm_layers)
+        frm_pts.pack(fill="x", padx=8, pady=1)
+        frm_pts.columnconfigure(1, weight=1)
+        ttk.Label(frm_pts, text="Puntos:").grid(row=0, column=0, sticky="w", padx=2)
+        var_pts = tk.StringVar(value=fl.n_points)
+        def _set_pts(*a, flr=fl, v=var_pts):
+            flr.n_points = v.get()
+        var_pts.trace_add("write", _set_pts)
+        ttk.Entry(frm_pts, textvariable=var_pts, width=7).grid(
+            row=0, column=1, sticky="ew", padx=2)
+        var_xlog = tk.BooleanVar(value=fl.x_log)
+        def _set_xlog(flr=fl, v=var_xlog):
+            flr.x_log = v.get()
+        ttk.Checkbutton(frm_pts, text="Log X", variable=var_xlog,
+                        command=_set_xlog).grid(row=0, column=2, padx=4)
+
+        # ── Estilo de linea ──
+        frm_style = ttk.Frame(self.frm_layers)
+        frm_style.pack(fill="x", padx=8, pady=1)
+        frm_style.columnconfigure(1, weight=1)
+        ttk.Label(frm_style, text="Linea:").grid(row=0, column=0, sticky="w", padx=2)
+        cmb_ls = ttk.Combobox(frm_style,
+                              values=["solida  (-)", "guiones  (--)",
+                                      "punto-guion  (-.)","punteada  (:)"],
+                              state="readonly", width=16)
+        ls_map = {"solida  (-)": "-", "guiones  (--)": "--",
+                  "punto-guion  (-.)": "-.", "punteada  (:)": ":"}
+        ls_inv = {v: k for k, v in ls_map.items()}
+        cmb_ls.set(ls_inv.get(fl.linestyle, "solida  (-)"))
+        def _set_ls(e, flr=fl, cmb=cmb_ls):
+            flr.linestyle = ls_map.get(cmb.get(), "-")
+        cmb_ls.bind("<<ComboboxSelected>>", _set_ls)
+        cmb_ls.grid(row=0, column=1, sticky="ew", padx=2)
+
+        # ── Color + label ──
+        frm_clr = ttk.Frame(self.frm_layers)
+        frm_clr.pack(fill="x", padx=8, pady=1)
+        frm_clr.columnconfigure(3, weight=1)
+
+        btn_clr = tk.Button(frm_clr, bg=fl.color, width=2, height=1,
+                            relief="raised",
+                            command=lambda flr=fl: self._pick_func_color(flr))
+        btn_clr.grid(row=0, column=0, padx=2)
+        setattr(fl, "_color_btn", btn_clr)
+
+        var_lbl_vis = tk.BooleanVar(value=fl.label_visible)
+        def _toggle_lbl(flr=fl, v=var_lbl_vis):
+            flr.label_visible = v.get(); self._replot()
+        ttk.Checkbutton(frm_clr, text="", variable=var_lbl_vis,
+                        command=_toggle_lbl).grid(row=0, column=1)
+
+        var_lbl = tk.StringVar(value=fl.label)
+        def _set_lbl(*a, flr=fl, v=var_lbl):
+            flr.label = v.get()
+        var_lbl.trace_add("write", _set_lbl)
+        ent_lbl = ttk.Entry(frm_clr, textvariable=var_lbl, width=12)
+        ent_lbl.grid(row=0, column=3, sticky="ew", padx=2)
+        ent_lbl.bind("<Return>",   lambda e: self._replot())
+        ent_lbl.bind("<FocusOut>", lambda e: self._replot())
+
+        # ── Offset y escala ──
+        frm_off = ttk.Frame(self.frm_layers)
+        frm_off.pack(fill="x", padx=8, pady=1)
+        frm_off.columnconfigure(1, weight=1)
+        frm_off.columnconfigure(3, weight=1)
+        ttk.Label(frm_off, text="Off Y:").grid(row=0, column=0, sticky="w", padx=2)
+        var_offy = tk.DoubleVar(value=fl.offset_y)
+        def _set_offy(*a, flr=fl, v=var_offy):
+            try: flr.offset_y = v.get()
+            except Exception: pass
+        var_offy.trace_add("write", _set_offy)
+        ttk.Entry(frm_off, textvariable=var_offy, width=7).grid(
+            row=0, column=1, sticky="ew", padx=2)
+        ttk.Label(frm_off, text="Off X:").grid(row=0, column=2, sticky="w", padx=2)
+        var_offx = tk.DoubleVar(value=fl.offset_x)
+        def _set_offx(*a, flr=fl, v=var_offx):
+            try: flr.offset_x = v.get()
+            except Exception: pass
+        var_offx.trace_add("write", _set_offx)
+        ttk.Entry(frm_off, textvariable=var_offx, width=7).grid(
+            row=0, column=3, sticky="ew", padx=2)
+
+        frm_sc = ttk.Frame(self.frm_layers)
+        frm_sc.pack(fill="x", padx=8, pady=1)
+        frm_sc.columnconfigure(1, weight=1)
+        ttk.Label(frm_sc, text="Escala:").grid(row=0, column=0, sticky="w", padx=2)
+        var_sc = tk.DoubleVar(value=fl.scale)
+        def _set_sc(*a, flr=fl, v=var_sc):
+            try: flr.scale = v.get()
+            except Exception: pass
+        var_sc.trace_add("write", _set_sc)
+        ttk.Entry(frm_sc, textvariable=var_sc, width=7).grid(
+            row=0, column=1, sticky="ew", padx=2)
+
+        # ── Constantes ──
+        frm_cst_hdr = ttk.Frame(self.frm_layers)
+        frm_cst_hdr.pack(fill="x", padx=8, pady=(4, 0))
+        frm_cst_hdr.columnconfigure(0, weight=1)
+        ttk.Label(frm_cst_hdr, text="Constantes:",
+                  font=("TkDefaultFont", 8, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Button(frm_cst_hdr, text="+ Agregar", width=8,
+                   command=lambda flr=fl: self._add_constant(flr)).grid(
+            row=0, column=1, padx=2)
+
+        # Frame contenedor de constantes (se rellena/actualiza dinamicamente)
+        frm_cst = ttk.Frame(self.frm_layers)
+        frm_cst.pack(fill="x", padx=8, pady=1)
+        frm_cst.columnconfigure(1, weight=1)
+        setattr(fl, "_frm_cst", frm_cst)
+        self._rebuild_constants_ui(fl)
+
+        # ── Boton graficar funcion ──
+        ttk.Button(self.frm_layers, text="Graficar funcion",
+                   command=lambda flr=fl: self._eval_and_replot(flr)).pack(
+            fill="x", padx=8, pady=(2, 4))
+
+    def _rebuild_constants_ui(self, fl):
+        """Reconstruye el subpanel de constantes de una FuncLayer."""
+        frm = fl._frm_cst
+        for w in frm.winfo_children():
+            w.destroy()
+        for ci, const in enumerate(fl.constants):
+            row_frm = ttk.Frame(frm)
+            row_frm.pack(fill="x", pady=1)
+            row_frm.columnconfigure(1, weight=1)
+
+            # Nombre
+            var_name = tk.StringVar(value=const["name"])
+            def _set_name(*a, c=const, v=var_name):
+                c["name"] = v.get()
+            var_name.trace_add("write", _set_name)
+            ttk.Entry(row_frm, textvariable=var_name, width=6).grid(
+                row=0, column=0, padx=2)
+
+            # Valor con slider
+            var_val = tk.DoubleVar(value=const["value"])
+            def _set_val(*a, c=const, v=var_val, flr=fl):
+                try:
+                    c["value"] = v.get()
+                except Exception:
+                    pass
+            var_val.trace_add("write", _set_val)
+
+            ttk.Entry(row_frm, textvariable=var_val, width=9).grid(
+                row=0, column=1, padx=2, sticky="ew")
+
+            # Slider entre min y max
+            var_min = tk.DoubleVar(value=const["min"])
+            var_max = tk.DoubleVar(value=const["max"])
+
+            def _slider_cb(val, c=const, v=var_val, flr=fl):
+                try:
+                    c["value"] = v.get()
+                except Exception:
+                    pass
+                self.root.after_idle(lambda flr=flr: self._eval_and_replot(flr))
+
+            sl = ttk.Scale(row_frm, from_=const["min"], to=const["max"],
+                           variable=var_val, orient="horizontal", length=80,
+                           command=_slider_cb)
+            sl.grid(row=0, column=2, padx=2)
+
+            # Min / Max editables
+            def _set_min(e, s=sl, vmin=var_min, vmax=var_max):
+                try:
+                    s.configure(from_=float(vmin.get()))
+                except Exception:
+                    pass
+            def _set_max(e, s=sl, vmin=var_min, vmax=var_max):
+                try:
+                    s.configure(to=float(vmax.get()))
+                except Exception:
+                    pass
+            ent_min = ttk.Entry(row_frm, textvariable=var_min, width=5)
+            ent_min.grid(row=0, column=3, padx=1)
+            ent_min.bind("<Return>",   _set_min)
+            ent_min.bind("<FocusOut>", _set_min)
+            ent_max = ttk.Entry(row_frm, textvariable=var_max, width=5)
+            ent_max.grid(row=0, column=4, padx=1)
+            ent_max.bind("<Return>",   _set_max)
+            ent_max.bind("<FocusOut>", _set_max)
+
+            # Boton eliminar
+            ttk.Button(row_frm, text="x", width=2,
+                       command=lambda idx=ci, flr=fl: self._remove_constant(flr, idx)
+                       ).grid(row=0, column=5, padx=2)
+
+    def _add_constant(self, fl):
+        fl.constants.append({"name": f"k{len(fl.constants)+1}",
+                             "value": 1.0, "min": 0.0, "max": 10.0})
+        self._rebuild_constants_ui(fl)
+        if DND_BACKEND == "tkinterdnd2":
+            self.root.after(50, self._register_dnd_tkinterdnd2)
+
+    def _remove_constant(self, fl, idx):
+        if 0 <= idx < len(fl.constants):
+            fl.constants.pop(idx)
+        self._rebuild_constants_ui(fl)
+
+    def _pick_func_color(self, fl):
+        result = colorchooser.askcolor(color=fl.color, title="Color de la funcion")
+        if result and result[1]:
+            fl.color = result[1]
+            btn = getattr(fl, "_color_btn", None)
+            if btn:
+                btn.config(bg=result[1])
+            self._replot()
+
+    def _eval_and_replot(self, fl):
+        """Evalua la funcion y redibuja. Muestra error inline si falla."""
+        self._replot()
+
     def _clear_all(self):
         self.layers.clear()
         self.cursor_clicks.clear()
@@ -806,7 +1170,7 @@ class OsciloscopioApp:
             return
 
         for li, layer in enumerate(self.layers):
-            # Cabecera
+            # Cabecera comun
             hdr = ttk.Frame(self.frm_layers)
             hdr.pack(fill="x", padx=2, pady=(6, 0))
             hdr.columnconfigure(1, weight=1)
@@ -817,12 +1181,22 @@ class OsciloscopioApp:
 
             ttk.Checkbutton(hdr, text="", variable=var_vis,
                             command=_toggle_layer).grid(row=0, column=0)
-            ttk.Label(hdr, text=f"[{li+1}] {layer.name}",
+
+            # Icono segun tipo
+            kind_tag = "[F]" if (hasattr(layer, "kind") and layer.kind == "func") else ""
+            ttk.Label(hdr, text=f"{kind_tag}[{li+1}] {layer.name}",
                       font=("TkDefaultFont", 9, "bold")).grid(
                 row=0, column=1, sticky="w", padx=2)
             ttk.Button(hdr, text="X", width=2,
                        command=lambda idx=li: self._remove_layer(idx)).grid(
                 row=0, column=2, padx=2)
+
+            # Controles especificos segun tipo
+            if hasattr(layer, "kind") and layer.kind == "func":
+                self._build_func_channel_ui(layer, li)
+                ttk.Separator(self.frm_layers, orient="horizontal").pack(
+                    fill="x", padx=4, pady=2)
+                continue
 
             # Canales
             for ci, col in enumerate(layer.y_cols):
@@ -917,7 +1291,9 @@ class OsciloscopioApp:
             self._replot()
 
     def _update_xy_combos(self):
-        all_cols = [col for layer in self.layers for col in layer.y_cols]
+        all_cols = [col for layer in self.layers
+                    if not (hasattr(layer, "kind") and layer.kind == "func")
+                    for col in layer.y_cols]
         self.cmb_xy_x["values"] = all_cols
         self.cmb_xy_y["values"] = all_cols
         if len(all_cols) >= 1: self.cmb_xy_x.set(all_cols[0])
@@ -983,6 +1359,42 @@ class OsciloscopioApp:
         for layer in self.layers:
             if not layer.visible:
                 continue
+
+            # ── FuncLayer ──────────────────────────────────────────────────
+            if hasattr(layer, "kind") and layer.kind == "func":
+                if not layer.expr.strip():
+                    continue
+                try:
+                    x_data, y_data = layer.evaluate()
+                except Exception as err:
+                    # Dibujar mensaje de error en el grafico
+                    self.ax.text(0.02, 0.05 + 0.06 * self.layers.index(layer),
+                                 f"[{layer.name}] Error: {err}",
+                                 transform=self.ax.transAxes,
+                                 color="#ff4444", fontsize=7, va="bottom")
+                    continue
+                lbl = layer.label if layer.label_visible else "_nolegend_"
+                self.ax.plot(x_data, y_data, color=layer.color,
+                             linewidth=1.4, linestyle=layer.linestyle,
+                             label=lbl)
+                has_data = True
+                if self.var_show_max.get() and len(y_data):
+                    idx_max = int(np.argmax(y_data))
+                    self.ax.annotate(f"MAX {y_data[idx_max]:.3g}",
+                        xy=(x_data[idx_max], y_data[idx_max]),
+                        xytext=(8, 8), textcoords="offset points",
+                        color=layer.color, fontsize=7,
+                        arrowprops=dict(arrowstyle="->", color=layer.color, lw=0.8))
+                if self.var_show_min.get() and len(y_data):
+                    idx_min = int(np.argmin(y_data))
+                    self.ax.annotate(f"MIN {y_data[idx_min]:.3g}",
+                        xy=(x_data[idx_min], y_data[idx_min]),
+                        xytext=(8, -14), textcoords="offset points",
+                        color=layer.color, fontsize=7,
+                        arrowprops=dict(arrowstyle="->", color=layer.color, lw=0.8))
+                continue
+
+            # ── Layer normal (CSV / .raw) ───────────────────────────────────
             for ci, col in enumerate(layer.y_cols):
                 if not layer.visible_channels[ci]:
                     continue
