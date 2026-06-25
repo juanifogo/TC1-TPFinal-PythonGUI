@@ -259,6 +259,14 @@ class FuncLayer:
     Capa que representa una funcion matematica introducida por el usuario.
     El eje X se define por rango y numero de puntos.
     Las constantes son variables editables que aparecen como sliders/entries.
+
+    IMPORTANTE - UNIDADES:
+    x_start, x_end y offset_x se interpretan SIEMPRE en SEGUNDOS (la unidad
+    base "cruda"), igual que los datos de un osciloscopio. La conversion a
+    la unidad de tiempo elegida en la GUI (ns/us/ms/s) se aplica recien al
+    momento de graficar (ver OsciloscopioApp._plot_normal), para que la
+    curva teorica quede siempre alineada con las capas CSV/LTspice sin
+    importar que unidad se elija para mostrar el eje X.
     """
     def __init__(self, name, color_offset=0):
         self.name          = name
@@ -700,7 +708,7 @@ class OsciloscopioApp:
         frm_range.pack(fill="x", padx=8, pady=1)
         frm_range.columnconfigure(1, weight=1)
         frm_range.columnconfigure(3, weight=1)
-        ttk.Label(frm_range, text="X:").grid(row=0, column=0, sticky="w", padx=2)
+        ttk.Label(frm_range, text="X (s):").grid(row=0, column=0, sticky="w", padx=2)
         var_x0 = tk.StringVar(value=fl.x_start)
         def _set_x0(*a, flr=fl, v=var_x0):
             flr.x_start = v.get()
@@ -785,7 +793,7 @@ class OsciloscopioApp:
         var_offy.trace_add("write", _set_offy)
         ttk.Entry(frm_off, textvariable=var_offy, width=7).grid(
             row=0, column=1, sticky="ew", padx=2)
-        ttk.Label(frm_off, text="Off X:").grid(row=0, column=2, sticky="w", padx=2)
+        ttk.Label(frm_off, text="Off X (s):").grid(row=0, column=2, sticky="w", padx=2)
         var_offx = tk.DoubleVar(value=fl.offset_x)
         def _set_offx(*a, flr=fl, v=var_offx):
             try: flr.offset_x = v.get()
@@ -1130,6 +1138,19 @@ class OsciloscopioApp:
                                  transform=self.ax.transAxes,
                                  color="#ff4444", fontsize=7, va="bottom")
                     continue
+
+                # FIX: convertir el eje X de la funcion teorica a la MISMA
+                # unidad de tiempo elegida en "UNIDADES (CSV osciloscopio)".
+                # evaluate() siempre devuelve x en SEGUNDOS (x_start/x_end/
+                # offset_x se ingresan en segundos); sin esta conversion la
+                # curva teorica queda en una escala distinta a la de las
+                # capas CSV/LTspice (que si se convierten en _get_x_data) y
+                # se ve como una linea vertical seguida de una horizontal
+                # cuando la unidad elegida no es "s".
+                if not layer.is_freq:
+                    t_factor, _ = TIME_UNITS[self.cmb_time.get()]
+                    x_data = x_data * t_factor
+
                 lbl = layer.label if layer.label_visible else "_nolegend_"
                 self.ax.plot(x_data, y_data, color=layer.color,
                              linewidth=1.4, linestyle=layer.linestyle,
