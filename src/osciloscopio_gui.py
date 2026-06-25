@@ -315,6 +315,8 @@ class OsciloscopioApp:
         self.root.resizable(True, True)
 
         self.layers       = []
+        self.cursor_mode   = False
+        self.cursor_clicks = []
         self._home_limits = None   # (xmin, xmax, ymin, ymax) del ultimo replot
         self._subplot_win = None   # ventana de configuracion de subplots
 
@@ -434,10 +436,50 @@ class OsciloscopioApp:
             row=0, column=0, columnspan=2, padx=4, pady=2, sticky="w")
         ttk.Checkbutton(f, text="Marcar minimo", variable=self.var_show_min).grid(
             row=1, column=0, columnspan=2, padx=4, pady=2, sticky="w")
+        
+        # ── Funcion teorica ──
+        f = self._lf(p, "FUNCION TEORICA", 9)
+        ttk.Label(f, text="y(x) =").grid(row=0, column=0, padx=4, pady=2, sticky="w")
+        self.ent_theory_formula = ttk.Entry(f)
+        self.ent_theory_formula.grid(row=0, column=1, padx=4, pady=2, sticky="ew")
+
+        ttk.Label(f, text="Etiqueta").grid(row=1, column=0, padx=4, pady=2, sticky="w")
+        self.ent_theory_label = ttk.Entry(f)
+        self.ent_theory_label.insert(0, "Función teórica")
+        self.ent_theory_label.grid(row=1, column=1, padx=4, pady=2, sticky="ew")
+
+        ttk.Label(f, text="X min").grid(row=2, column=0, padx=4, pady=2, sticky="w")
+        self.ent_theory_xmin = ttk.Entry(f, width=12)
+        self.ent_theory_xmin.insert(0, "0")
+        self.ent_theory_xmin.grid(row=2, column=1, padx=4, pady=2, sticky="w")
+
+        ttk.Label(f, text="X max").grid(row=3, column=0, padx=4, pady=2, sticky="w")
+        self.ent_theory_xmax = ttk.Entry(f, width=12)
+        self.ent_theory_xmax.insert(0, "1")
+        self.ent_theory_xmax.grid(row=3, column=1, padx=4, pady=2, sticky="w")
+
+        ttk.Label(f, text="Puntos").grid(row=4, column=0, padx=4, pady=2, sticky="w")
+        self.ent_theory_points = ttk.Entry(f, width=12)
+        self.ent_theory_points.insert(0, "500")
+        self.ent_theory_points.grid(row=4, column=1, padx=4, pady=2, sticky="w")
+
+        ttk.Button(f, text="Agregar función teórica",
+                   command=self._add_theoretical_function).grid(
+            row=5, column=0, columnspan=2, padx=4, pady=8, sticky="ew")
+
+        # ── Cursores ──
+        f = self._lf(p, "CURSORES", 10)
+        self.btn_cursor = ttk.Button(f, text="Activar cursores",
+                                     command=self._toggle_cursors)
+        self.btn_cursor.grid(row=0, column=0, padx=4, pady=4, sticky="ew")
+        ttk.Button(f, text="Limpiar", command=self._clear_cursors).grid(
+            row=0, column=1, padx=4, pady=4, sticky="ew")
+        self.lbl_cursor_info = ttk.Label(f, text="", wraplength=250)
+        self.lbl_cursor_info.grid(row=1, column=0, columnspan=2, padx=4, pady=2)
 
         # ── Boton graficar ──
         ttk.Button(p, text="GRAFICAR", command=self._replot).grid(
-            row=10, column=0, padx=4, pady=8, sticky="ew")
+            row=11, column=0, padx=4, pady=8, sticky="ew")
 
     def _build_plot(self, parent):
         self.fig = Figure(figsize=(8, 5))
@@ -486,6 +528,63 @@ class OsciloscopioApp:
             messagebox.showerror("Error al leer el CSV", str(e))
             return
         self._add_layer(df, x_unit, y_unit, path)
+
+    def _eval_theoretical_formula(self, formula, x):
+        expr = formula.strip()
+        if expr.lower().startswith("y="):
+            expr = expr[2:].strip()
+        allowed = {
+            "np": np,
+            "sin": np.sin,
+            "cos": np.cos,
+            "tan": np.tan,
+            "asin": np.arcsin,
+            "acos": np.arccos,
+            "atan": np.arctan,
+            "exp": np.exp,
+            "sqrt": np.sqrt,
+            "log": np.log,
+            "log10": np.log10,
+            "abs": np.abs,
+            "pi": np.pi,
+            "e": np.e,
+            "floor": np.floor,
+            "ceil": np.ceil,
+            "round": np.round,
+            "sign": np.sign,
+            "x": x,
+        }
+        return eval(expr, {"__builtins__": {}}, allowed)
+
+    def _add_theoretical_function(self):
+        formula = self.ent_theory_formula.get().strip()
+        label = self.ent_theory_label.get().strip() or "Función teórica"
+        try:
+            xmin = float(self.ent_theory_xmin.get())
+            xmax = float(self.ent_theory_xmax.get())
+            if xmin >= xmax:
+                raise ValueError("X max debe ser mayor que X min.")
+            points = int(self.ent_theory_points.get())
+            if points <= 1:
+                raise ValueError("La cantidad de puntos debe ser mayor que 1.")
+            if not formula:
+                raise ValueError("Ingrese una fórmula para y(x). Ej: sin(2*pi*x)")
+        except ValueError as e:
+            messagebox.showerror("Error en función teórica", str(e))
+            return
+
+        x_raw = np.linspace(xmin, xmax, points)
+        try:
+            y_raw = self._eval_theoretical_formula(formula, x_raw)
+        except Exception as e:
+            messagebox.showerror("Error en función teórica",
+                f"No se pudo evaluar la fórmula:\n{e}")
+            return
+
+        x_unit = "hz" if any(layer.is_freq for layer in self.layers) else self.cmb_time.get()
+        col_x = f"x [{x_unit}]"
+        df = pd.DataFrame({col_x: x_raw, label: y_raw})
+        self._add_layer(df, x_unit, "V", f"Teórica: {label}")
 
     def _open_csv(self):
         path = filedialog.askopenfilename(
@@ -762,6 +861,47 @@ class OsciloscopioApp:
                 for text in leg.get_texts():
                     text.set_color("#ddddff")
 
+        self._redraw_cursors()
+ # ─── Cursores ──────────────────────────────
+
+    def _toggle_cursors(self):
+        self.cursor_mode = not self.cursor_mode
+        if self.cursor_mode:
+            self.btn_cursor.config(text="Cursores: ON")
+            self.cursor_clicks = []
+            self._cid = self.canvas.mpl_connect(
+                "button_press_event", self._on_cursor_click)
+        else:
+            self.btn_cursor.config(text="Activar cursores")
+            if hasattr(self, "_cid"):
+                self.canvas.mpl_disconnect(self._cid)
+
+    def _on_cursor_click(self, event):
+        if event.inaxes != self.ax or event.xdata is None:
+            return
+        self.cursor_clicks.append(event.xdata)
+        color = "#ffff00" if len(self.cursor_clicks) % 2 == 1 else "#ff6600"
+        self.ax.axvline(x=event.xdata, color=color,
+                        linestyle="--", linewidth=1, alpha=0.9)
+        self.canvas.draw()
+        if len(self.cursor_clicks) >= 2:
+            dx   = abs(self.cursor_clicks[-1] - self.cursor_clicks[-2])
+            unit = self.cmb_time.get()
+            dx_s = dx / TIME_UNITS[unit][0]
+            freq_str = f"{1/dx_s:.4g} Hz" if dx_s != 0 else "---"
+            self.lbl_cursor_info.config(
+                text=f"dX = {dx:.4g} {unit}   |   freq ~ {freq_str}")
+
+    def _redraw_cursors(self):
+        for i, x in enumerate(self.cursor_clicks):
+            color = "#ffff00" if i % 2 == 0 else "#ff6600"
+            self.ax.axvline(x=x, color=color, linestyle="--",
+                            linewidth=1, alpha=0.9)
+
+    def _clear_cursors(self):
+        self.cursor_clicks = []
+        self.lbl_cursor_info.config(text="")
+        self._replot()
 
 # ─────────────────────────────────────────────
 #  Main
