@@ -1,9 +1,9 @@
 """
-GUI Osciloscopio - Graficador de archivos CSV (osciloscopio / FRA)
+GUI Osciloscopio - Graficador de archivos CSV (osciloscopio / FRA) y LTspice (.raw)
 Soporta superposicion de multiples archivos.
 
 Requisitos:
-    pip install matplotlib pandas numpy
+    pip install matplotlib pandas numpy ltspice
 
 Uso:
     python osciloscopio_gui.py
@@ -24,6 +24,13 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 from matplotlib.widgets import SubplotTool
 import matplotlib.ticker as ticker
+
+try:
+    import ltspice
+    LTSPICE_AVAILABLE = True
+except ImportError:
+    LTSPICE_AVAILABLE = False
+
 
 # ─────────────────────────────────────────────
 #  Constantes
@@ -115,6 +122,77 @@ def load_csv(path):
     except Exception as e:
         raise ValueError(f"No se pudo leer el archivo CSV: {e}")
 
+#─────────────────────────────────────────────
+#  Parser LTspice .raw
+# ─────────────────────────────────────────────
+
+def load_ltspice(path):
+    if not LTSPICE_AVAILABLE:
+        raise ValueError("La libreria 'ltspice' no esta instalada.\npip install ltspice")
+    l = ltspice.Ltspice(path)
+    l.parse()
+
+    # get_time() lanza InvalidPhysicalValueRequestedException en simulaciones AC
+    # get_frequency() lanza lo mismo en simulaciones transient → usar try/except en ambos
+    time = None
+    try:
+        t = l.get_time()
+        if t is not None and len(t) > 0:
+            time = t
+    except Exception:
+        pass
+
+    freq = None
+    try:
+        f = l.get_frequency()
+        if f is not None and len(f) > 0:
+            freq = f
+    except Exception:
+        pass
+
+    if time is not None:
+        x_data, x_name, x_unit, is_ac = np.array(time, dtype=float), "time [second]", "second", False
+    elif freq is not None:
+        x_data, x_name, x_unit, is_ac = np.array(freq, dtype=float), "frequency [hz]", "hz", True
+    else:
+        raise ValueError("No se encontro eje temporal ni de frecuencia.")
+
+    variables = None
+    for attr in ("variables", "_variables", "get_variable_names"):
+        candidate = getattr(l, attr, None)
+        if candidate is not None:
+            variables = candidate() if callable(candidate) else list(candidate)
+            if variables:
+                break
+    if not variables:
+        raise ValueError("No se pudieron obtener los nombres de variables del .raw.")
+
+    signal_vars = [v for v in variables if str(v).lower() not in {"time", "frequency"}]
+    if not signal_vars:
+        raise ValueError("No se encontraron senales en el archivo LTspice.")
+
+    df = pd.DataFrame({x_name: x_data})
+    for var in signal_vars:
+        try:
+            raw = l.get_data(var)
+            if raw is None or len(raw) == 0:
+                continue
+            data = np.array(raw, dtype=complex)
+            if is_ac:
+                mag = np.abs(data)
+                arr = np.where(mag > 0, 20 * np.log10(mag), -200.0)
+                col_name = f"{var} [dB]"
+            else:
+                arr, col_name = data.real, f"{var} [V]"
+            if len(arr) == len(x_data):
+                df[col_name] = arr
+        except Exception:
+            continue
+
+    if df.shape[1] < 2:
+        raise ValueError("No se pudieron extraer senales del archivo .raw.")
+    return df, x_unit, "db" if is_ac else "volt"
+
 
 
 # ─────────────────────────────────────────────
@@ -172,7 +250,83 @@ class FixedToolbar(NavigationToolbar2Tk):
     def configure_subplots(self, *args):
         self._app._open_subplot_config()
 
+# ─────────────────────────────────────────────
+#  Clase FuncLayer — capa de funcion teorica
+# ─────────────────────────────────────────────
 
+class FuncLayer:
+    """
+    Capa que representa una funcion matematica introducida por el usuario.
+    El eje X se define por rango y numero de puntos.
+    Las constantes son variables editables que aparecen como sliders/entries.
+    """
+    def __init__(self, name, color_offset=0):
+        self.name          = name
+        self.visible       = True
+        self.is_freq       = False
+        self.kind          = "func"
+
+        self.expr          = ""
+        self.x_start       = "0"
+        self.x_end         = "1e-3"
+        self.n_points      = "1000"
+        self.x_log         = False
+
+        self.constants     = []
+
+        self.color         = COLORS[color_offset % len(COLORS)]
+        self.label         = name
+        self.label_visible = True
+        self.offset_y      = 0.0
+        self.offset_x       = 0.0
+        self.scale          = 1.0
+        self.linestyle      = "-"
+
+    def evaluate(self):
+        try:
+            n   = max(2, int(float(self.n_points)))
+            x0  = float(self.x_start)
+            x1  = float(self.x_end)
+            if x0 >= x1:
+                raise ValueError("X inicio debe ser menor que X fin.")
+            if self.x_log:
+                if x0 <= 0:
+                    raise ValueError("Para escala log X, X inicio debe ser > 0.")
+                x = np.logspace(np.log10(x0), np.log10(x1), n)
+            else:
+                x = np.linspace(x0, x1, n)
+        except Exception as e:
+            raise ValueError(f"Rango X invalido: {e}")
+
+        ns = {
+            "np": np, "pi": np.pi, "e": np.e, "inf": np.inf,
+            "sin": np.sin, "cos": np.cos, "tan": np.tan,
+            "asin": np.arcsin, "acos": np.arccos, "atan": np.arctan,
+            "sinh": np.sinh, "cosh": np.cosh, "tanh": np.tanh,
+            "exp": np.exp, "log": np.log, "log10": np.log10, "log2": np.log2,
+            "sqrt": np.sqrt, "abs": np.abs, "sign": np.sign,
+            "floor": np.floor, "ceil": np.ceil,
+            "linspace": np.linspace, "logspace": np.logspace,
+            "x": x,
+        }
+        for c in self.constants:
+            try:
+                ns[c["name"]] = float(c["value"])
+            except Exception:
+                pass
+
+        try:
+            y = eval(self.expr, {"__builtins__": {}}, ns)
+            y = np.asarray(y, dtype=float)
+            if y.shape == ():
+                y = np.full_like(x, float(y))
+        except Exception as e:
+            raise ValueError(f"Error en la expresion: {e}")
+
+        y = y * self.scale + self.offset_y
+        x = x + self.offset_x
+        return x, y
+    
 # ─────────────────────────────────────────────
 #  Ventana "Configure subplots" con entradas numericas
 # ─────────────────────────────────────────────
@@ -360,9 +514,19 @@ class OsciloscopioApp:
 
     def _build_controls(self, p):
         # ── Archivos ──
+
         f = self._lf(p, "ARCHIVOS", 0)
         ttk.Button(f, text="+ Agregar CSV",
-                   command=self._open_csv).grid(row=0, column=0, padx=4, pady=8, sticky="ew")
+            command=self._open_csv).grid(row=0, column=0, padx=4, pady=4, sticky="ew")
+        lt_txt = "+ Agregar LTspice (.raw)" if LTSPICE_AVAILABLE else "+ Agregar LTspice (*)"
+        ttk.Button(f, text=lt_txt,
+            command=self._open_ltspice).grid(row=0, column=1, padx=4, pady=4, sticky="ew")
+        if not LTSPICE_AVAILABLE:
+            ttk.Label(f, text="(*) pip install ltspice",
+                foreground="#ff8800").grid(row=1, column=0, columnspan=2, padx=4, pady=(0,2))
+        ttk.Button(f, text="+ Funcion teorica",
+                   command=self._add_func_layer).grid(row=2, column=0, columnspan=2,
+                                                       padx=4, pady=(0,4), sticky="ew")
 
         # ── Titulos ──
         f = self._lf(p, "TITULOS", 1)
@@ -437,35 +601,6 @@ class OsciloscopioApp:
         ttk.Checkbutton(f, text="Marcar minimo", variable=self.var_show_min).grid(
             row=1, column=0, columnspan=2, padx=4, pady=2, sticky="w")
         
-        # ── Funcion teorica ──
-        f = self._lf(p, "FUNCION TEORICA", 9)
-        ttk.Label(f, text="y(x) =").grid(row=0, column=0, padx=4, pady=2, sticky="w")
-        self.ent_theory_formula = ttk.Entry(f)
-        self.ent_theory_formula.grid(row=0, column=1, padx=4, pady=2, sticky="ew")
-
-        ttk.Label(f, text="Etiqueta").grid(row=1, column=0, padx=4, pady=2, sticky="w")
-        self.ent_theory_label = ttk.Entry(f)
-        self.ent_theory_label.insert(0, "Función teórica")
-        self.ent_theory_label.grid(row=1, column=1, padx=4, pady=2, sticky="ew")
-
-        ttk.Label(f, text="X min").grid(row=2, column=0, padx=4, pady=2, sticky="w")
-        self.ent_theory_xmin = ttk.Entry(f, width=12)
-        self.ent_theory_xmin.insert(0, "0")
-        self.ent_theory_xmin.grid(row=2, column=1, padx=4, pady=2, sticky="w")
-
-        ttk.Label(f, text="X max").grid(row=3, column=0, padx=4, pady=2, sticky="w")
-        self.ent_theory_xmax = ttk.Entry(f, width=12)
-        self.ent_theory_xmax.insert(0, "1")
-        self.ent_theory_xmax.grid(row=3, column=1, padx=4, pady=2, sticky="w")
-
-        ttk.Label(f, text="Puntos").grid(row=4, column=0, padx=4, pady=2, sticky="w")
-        self.ent_theory_points = ttk.Entry(f, width=12)
-        self.ent_theory_points.insert(0, "500")
-        self.ent_theory_points.grid(row=4, column=1, padx=4, pady=2, sticky="w")
-
-        ttk.Button(f, text="Agregar función teórica",
-                   command=self._add_theoretical_function).grid(
-            row=5, column=0, columnspan=2, padx=4, pady=8, sticky="ew")
 
         # ── Cursores ──
         f = self._lf(p, "CURSORES", 10)
@@ -502,7 +637,7 @@ class OsciloscopioApp:
         self.ax.clear()
         self.ax.set_facecolor("#f0f0f0")
         self.ax.text(0.5, 0.5,
-                     "Abri uno o varios archivos\n.csv\npara comenzar",
+                     "Abri uno o varios archivos\n.csv o .raw (LTspice)\npara comenzar",
                      ha="center", va="center", transform=self.ax.transAxes,
                      color="#555555", fontsize=12)
         self.ax.set_xticks([])
@@ -528,71 +663,268 @@ class OsciloscopioApp:
             messagebox.showerror("Error al leer el CSV", str(e))
             return
         self._add_layer(df, x_unit, y_unit, path)
-
-    def _eval_theoretical_formula(self, formula, x):
-        expr = formula.strip()
-        if expr.lower().startswith("y="):
-            expr = expr[2:].strip()
-        allowed = {
-            "np": np,
-            "sin": np.sin,
-            "cos": np.cos,
-            "tan": np.tan,
-            "asin": np.arcsin,
-            "acos": np.arccos,
-            "atan": np.arctan,
-            "exp": np.exp,
-            "sqrt": np.sqrt,
-            "log": np.log,
-            "log10": np.log10,
-            "abs": np.abs,
-            "pi": np.pi,
-            "e": np.e,
-            "floor": np.floor,
-            "ceil": np.ceil,
-            "round": np.round,
-            "sign": np.sign,
-            "x": x,
-        }
-        return eval(expr, {"__builtins__": {}}, allowed)
-
-    def _add_theoretical_function(self):
-        formula = self.ent_theory_formula.get().strip()
-        label = self.ent_theory_label.get().strip() or "Función teórica"
+        
+    def _load_ltspice_file(self, path):
         try:
-            xmin = float(self.ent_theory_xmin.get())
-            xmax = float(self.ent_theory_xmax.get())
-            if xmin >= xmax:
-                raise ValueError("X max debe ser mayor que X min.")
-            points = int(self.ent_theory_points.get())
-            if points <= 1:
-                raise ValueError("La cantidad de puntos debe ser mayor que 1.")
-            if not formula:
-                raise ValueError("Ingrese una fórmula para y(x). Ej: sin(2*pi*x)")
+            df, x_unit, y_unit = load_ltspice(path)
         except ValueError as e:
-            messagebox.showerror("Error en función teórica", str(e))
+            messagebox.showerror("Error al leer archivo LTspice", str(e))
             return
+        self._add_layer(df, x_unit, y_unit, path)
 
-        x_raw = np.linspace(xmin, xmax, points)
-        try:
-            y_raw = self._eval_theoretical_formula(formula, x_raw)
-        except Exception as e:
-            messagebox.showerror("Error en función teórica",
-                f"No se pudo evaluar la fórmula:\n{e}")
-            return
+    def _add_func_layer(self):
+        color_offset = sum(
+            (len(l.y_cols) if hasattr(l, "y_cols") else 1)
+            for l in self.layers
+        )
+        n = sum(1 for l in self.layers if hasattr(l, "kind") and l.kind == "func")
+        fl = FuncLayer(f"Funcion {n+1}", color_offset=color_offset)
+        self.layers.append(fl)
+        self._rebuild_layers_panel()
 
-        x_unit = "hz" if any(layer.is_freq for layer in self.layers) else self.cmb_time.get()
-        col_x = f"x [{x_unit}]"
-        df = pd.DataFrame({col_x: x_raw, label: y_raw})
-        self._add_layer(df, x_unit, "V", f"Teórica: {label}")
+    def _build_func_channel_ui(self, fl, li):
+        frm_expr = ttk.Frame(self.frm_layers)
+        frm_expr.pack(fill="x", padx=8, pady=2)
+        frm_expr.columnconfigure(1, weight=1)
+        ttk.Label(frm_expr, text="f(x) =").grid(row=0, column=0, sticky="w", padx=2)
+        var_expr = tk.StringVar(value=fl.expr)
+        def _set_expr(*a, flr=fl, v=var_expr):
+            flr.expr = v.get()
+        var_expr.trace_add("write", _set_expr)
+        ent_expr = ttk.Entry(frm_expr, textvariable=var_expr)
+        ent_expr.grid(row=0, column=1, sticky="ew", padx=2)
+        ent_expr.bind("<Return>",   lambda e: self._eval_and_replot(fl))
+        ent_expr.bind("<FocusOut>", lambda e: self._eval_and_replot(fl))
+
+        frm_range = ttk.Frame(self.frm_layers)
+        frm_range.pack(fill="x", padx=8, pady=1)
+        frm_range.columnconfigure(1, weight=1)
+        frm_range.columnconfigure(3, weight=1)
+        ttk.Label(frm_range, text="X:").grid(row=0, column=0, sticky="w", padx=2)
+        var_x0 = tk.StringVar(value=fl.x_start)
+        def _set_x0(*a, flr=fl, v=var_x0):
+            flr.x_start = v.get()
+        var_x0.trace_add("write", _set_x0)
+        ttk.Entry(frm_range, textvariable=var_x0, width=8).grid(
+            row=0, column=1, sticky="ew", padx=2)
+        ttk.Label(frm_range, text="a").grid(row=0, column=2, padx=2)
+        var_x1 = tk.StringVar(value=fl.x_end)
+        def _set_x1(*a, flr=fl, v=var_x1):
+            flr.x_end = v.get()
+        var_x1.trace_add("write", _set_x1)
+        ttk.Entry(frm_range, textvariable=var_x1, width=8).grid(
+            row=0, column=3, sticky="ew", padx=2)
+
+        frm_pts = ttk.Frame(self.frm_layers)
+        frm_pts.pack(fill="x", padx=8, pady=1)
+        frm_pts.columnconfigure(1, weight=1)
+        ttk.Label(frm_pts, text="Puntos:").grid(row=0, column=0, sticky="w", padx=2)
+        var_pts = tk.StringVar(value=fl.n_points)
+        def _set_pts(*a, flr=fl, v=var_pts):
+            flr.n_points = v.get()
+        var_pts.trace_add("write", _set_pts)
+        ttk.Entry(frm_pts, textvariable=var_pts, width=7).grid(
+            row=0, column=1, sticky="ew", padx=2)
+        var_xlog = tk.BooleanVar(value=fl.x_log)
+        def _set_xlog(flr=fl, v=var_xlog):
+            flr.x_log = v.get()
+        ttk.Checkbutton(frm_pts, text="Log X", variable=var_xlog,
+                        command=_set_xlog).grid(row=0, column=2, padx=4)
+
+        frm_style = ttk.Frame(self.frm_layers)
+        frm_style.pack(fill="x", padx=8, pady=1)
+        frm_style.columnconfigure(1, weight=1)
+        ttk.Label(frm_style, text="Linea:").grid(row=0, column=0, sticky="w", padx=2)
+        cmb_ls = ttk.Combobox(frm_style,
+                              values=["solida  (-)", "guiones  (--)",
+                                      "punto-guion  (-.)","punteada  (:)"],
+                              state="readonly", width=16)
+        ls_map = {"solida  (-)": "-", "guiones  (--)": "--",
+                  "punto-guion  (-.)": "-.", "punteada  (:)": ":"}
+        ls_inv = {v: k for k, v in ls_map.items()}
+        cmb_ls.set(ls_inv.get(fl.linestyle, "solida  (-)"))
+        def _set_ls(e, flr=fl, cmb=cmb_ls):
+            flr.linestyle = ls_map.get(cmb.get(), "-")
+        cmb_ls.bind("<<ComboboxSelected>>", _set_ls)
+        cmb_ls.grid(row=0, column=1, sticky="ew", padx=2)
+
+        frm_clr = ttk.Frame(self.frm_layers)
+        frm_clr.pack(fill="x", padx=8, pady=1)
+        frm_clr.columnconfigure(3, weight=1)
+
+        btn_clr = tk.Button(frm_clr, bg=fl.color, width=2, height=1,
+                            relief="raised",
+                            command=lambda flr=fl: self._pick_func_color(flr))
+        btn_clr.grid(row=0, column=0, padx=2)
+        setattr(fl, "_color_btn", btn_clr)
+
+        var_lbl_vis = tk.BooleanVar(value=fl.label_visible)
+        def _toggle_lbl(flr=fl, v=var_lbl_vis):
+            flr.label_visible = v.get(); self._replot()
+        ttk.Checkbutton(frm_clr, text="", variable=var_lbl_vis,
+                        command=_toggle_lbl).grid(row=0, column=1)
+
+        var_lbl = tk.StringVar(value=fl.label)
+        def _set_lbl(*a, flr=fl, v=var_lbl):
+            flr.label = v.get()
+        var_lbl.trace_add("write", _set_lbl)
+        ent_lbl = ttk.Entry(frm_clr, textvariable=var_lbl, width=12)
+        ent_lbl.grid(row=0, column=3, sticky="ew", padx=2)
+        ent_lbl.bind("<Return>",   lambda e: self._replot())
+        ent_lbl.bind("<FocusOut>", lambda e: self._replot())
+
+        frm_off = ttk.Frame(self.frm_layers)
+        frm_off.pack(fill="x", padx=8, pady=1)
+        frm_off.columnconfigure(1, weight=1)
+        frm_off.columnconfigure(3, weight=1)
+        ttk.Label(frm_off, text="Off Y:").grid(row=0, column=0, sticky="w", padx=2)
+        var_offy = tk.DoubleVar(value=fl.offset_y)
+        def _set_offy(*a, flr=fl, v=var_offy):
+            try: flr.offset_y = v.get()
+            except Exception: pass
+        var_offy.trace_add("write", _set_offy)
+        ttk.Entry(frm_off, textvariable=var_offy, width=7).grid(
+            row=0, column=1, sticky="ew", padx=2)
+        ttk.Label(frm_off, text="Off X:").grid(row=0, column=2, sticky="w", padx=2)
+        var_offx = tk.DoubleVar(value=fl.offset_x)
+        def _set_offx(*a, flr=fl, v=var_offx):
+            try: flr.offset_x = v.get()
+            except Exception: pass
+        var_offx.trace_add("write", _set_offx)
+        ttk.Entry(frm_off, textvariable=var_offx, width=7).grid(
+            row=0, column=3, sticky="ew", padx=2)
+
+        frm_sc = ttk.Frame(self.frm_layers)
+        frm_sc.pack(fill="x", padx=8, pady=1)
+        frm_sc.columnconfigure(1, weight=1)
+        ttk.Label(frm_sc, text="Escala:").grid(row=0, column=0, sticky="w", padx=2)
+        var_sc = tk.DoubleVar(value=fl.scale)
+        def _set_sc(*a, flr=fl, v=var_sc):
+            try: flr.scale = v.get()
+            except Exception: pass
+        var_sc.trace_add("write", _set_sc)
+        ttk.Entry(frm_sc, textvariable=var_sc, width=7).grid(
+            row=0, column=1, sticky="ew", padx=2)
+
+        frm_cst_hdr = ttk.Frame(self.frm_layers)
+        frm_cst_hdr.pack(fill="x", padx=8, pady=(4, 0))
+        frm_cst_hdr.columnconfigure(0, weight=1)
+        ttk.Label(frm_cst_hdr, text="Constantes:",
+                  font=("TkDefaultFont", 8, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Button(frm_cst_hdr, text="+ Agregar", width=8,
+                   command=lambda flr=fl: self._add_constant(flr)).grid(
+            row=0, column=1, padx=2)
+
+        frm_cst = ttk.Frame(self.frm_layers)
+        frm_cst.pack(fill="x", padx=8, pady=1)
+        frm_cst.columnconfigure(1, weight=1)
+        setattr(fl, "_frm_cst", frm_cst)
+        self._rebuild_constants_ui(fl)
+
+        ttk.Button(self.frm_layers, text="Graficar funcion",
+                   command=lambda flr=fl: self._eval_and_replot(flr)).pack(
+            fill="x", padx=8, pady=(2, 4))
+
+    def _rebuild_constants_ui(self, fl):
+        frm = fl._frm_cst
+        for w in frm.winfo_children():
+            w.destroy()
+        for ci, const in enumerate(fl.constants):
+            row_frm = ttk.Frame(frm)
+            row_frm.pack(fill="x", pady=1)
+            row_frm.columnconfigure(1, weight=1)
+
+            var_name = tk.StringVar(value=const["name"])
+            def _set_name(*a, c=const, v=var_name):
+                c["name"] = v.get()
+            var_name.trace_add("write", _set_name)
+            ttk.Entry(row_frm, textvariable=var_name, width=6).grid(
+                row=0, column=0, padx=2)
+
+            var_val = tk.DoubleVar(value=const["value"])
+            def _set_val(*a, c=const, v=var_val):
+                try: c["value"] = v.get()
+                except Exception: pass
+            var_val.trace_add("write", _set_val)
+
+            ttk.Entry(row_frm, textvariable=var_val, width=9).grid(
+                row=0, column=1, padx=2, sticky="ew")
+
+            var_min = tk.DoubleVar(value=const["min"])
+            var_max = tk.DoubleVar(value=const["max"])
+
+            def _slider_cb(val, c=const, v=var_val, flr=fl):
+                try: c["value"] = v.get()
+                except Exception: pass
+                self.root.after_idle(lambda flr=flr: self._eval_and_replot(flr))
+
+            sl = ttk.Scale(row_frm, from_=const["min"], to=const["max"],
+                           variable=var_val, orient="horizontal", length=80,
+                           command=_slider_cb)
+            sl.grid(row=0, column=2, padx=2)
+
+            def _set_min(e, s=sl, vmin=var_min):
+                try: s.configure(from_=float(vmin.get()))
+                except Exception: pass
+            def _set_max(e, s=sl, vmax=var_max):
+                try: s.configure(to=float(vmax.get()))
+                except Exception: pass
+            ent_min = ttk.Entry(row_frm, textvariable=var_min, width=5)
+            ent_min.grid(row=0, column=3, padx=1)
+            ent_min.bind("<Return>",   _set_min)
+            ent_min.bind("<FocusOut>", _set_min)
+            ent_max = ttk.Entry(row_frm, textvariable=var_max, width=5)
+            ent_max.grid(row=0, column=4, padx=1)
+            ent_max.bind("<Return>",   _set_max)
+            ent_max.bind("<FocusOut>", _set_max)
+
+            ttk.Button(row_frm, text="x", width=2,
+                       command=lambda idx=ci, flr=fl: self._remove_constant(flr, idx)
+                       ).grid(row=0, column=5, padx=2)
+
+    def _add_constant(self, fl):
+        fl.constants.append({"name": f"k{len(fl.constants)+1}",
+                             "value": 1.0, "min": 0.0, "max": 10.0})
+        self._rebuild_constants_ui(fl)
+
+    def _remove_constant(self, fl, idx):
+        if 0 <= idx < len(fl.constants):
+            fl.constants.pop(idx)
+        self._rebuild_constants_ui(fl)
+
+    def _pick_func_color(self, fl):
+        result = colorchooser.askcolor(color=fl.color, title="Color de la funcion")
+        if result and result[1]:
+            fl.color = result[1]
+            btn = getattr(fl, "_color_btn", None)
+            if btn:
+                btn.config(bg=result[1])
+            self._replot()
+
+    def _eval_and_replot(self, fl):
+        self._replot()
 
     def _open_csv(self):
         path = filedialog.askopenfilename(
             title="Abrir CSV",
-            filetypes=[("CSV files", "*.csv")]
-        )
+            filetypes=[("CSV files", "*.csv")])
         if path:
             self._load_csv_file(path)
+
+    def _open_ltspice(self):
+        if not LTSPICE_AVAILABLE:
+            messagebox.showerror("Libreria no instalada", "pip install ltspice")
+            return
+        self.root.update_idletasks()
+        geom = self.root.geometry()
+        path = filedialog.askopenfilename(
+            title="Agregar archivo LTspice (.raw)",
+            filetypes=[("LTspice raw", "*.raw"), ("Todos", "*.*")])
+        self.root.geometry(geom)
+        self.root.update_idletasks()
+        if path:
+            self._load_ltspice_file(path)
+
 
     def _add_layer(self, df, x_unit, y_unit, path):
         color_offset = sum(len(l.y_cols) for l in self.layers)
@@ -629,13 +961,20 @@ class OsciloscopioApp:
                             command=_toggle_layer).grid(row=0, column=0)
 
             # Icono segun tipo
-            ttk.Label(hdr, text=f"[{li+1}] {layer.name}",
+            kind_tag = "[F]" if (hasattr(layer, "kind") and layer.kind == "func") else ""
+            ttk.Label(hdr, text=f"{kind_tag}[{li+1}] {layer.name}",
                       font=("TkDefaultFont", 9, "bold")).grid(
                 row=0, column=1, sticky="w", padx=2)
             ttk.Button(hdr, text="X", width=2,
                        command=lambda idx=li: self._remove_layer(idx)).grid(
                 row=0, column=2, padx=2)
-
+            
+            # Controles especificos segun tipo
+            if hasattr(layer, "kind") and layer.kind == "func":
+                self._build_func_channel_ui(layer, li)
+                ttk.Separator(self.frm_layers, orient="horizontal").pack(
+                    fill="x", padx=4, pady=2)
+                continue
             # Canales
             for ci, col in enumerate(layer.y_cols):
                 frm = ttk.Frame(self.frm_layers)
@@ -778,6 +1117,38 @@ class OsciloscopioApp:
 
         for layer in self.layers:
             if not layer.visible:
+                continue
+            # ── FuncLayer ──────────────────────────────────────────────────
+            if hasattr(layer, "kind") and layer.kind == "func":
+                if not layer.expr.strip():
+                    continue
+                try:
+                    x_data, y_data = layer.evaluate()
+                except Exception as err:
+                    self.ax.text(0.02, 0.05 + 0.06 * self.layers.index(layer),
+                                 f"[{layer.name}] Error: {err}",
+                                 transform=self.ax.transAxes,
+                                 color="#ff4444", fontsize=7, va="bottom")
+                    continue
+                lbl = layer.label if layer.label_visible else "_nolegend_"
+                self.ax.plot(x_data, y_data, color=layer.color,
+                             linewidth=1.4, linestyle=layer.linestyle,
+                             label=lbl)
+                has_data = True
+                if self.var_show_max.get() and len(y_data):
+                    idx_max = int(np.argmax(y_data))
+                    self.ax.annotate(f"MAX {y_data[idx_max]:.3g}",
+                        xy=(x_data[idx_max], y_data[idx_max]),
+                        xytext=(8, 8), textcoords="offset points",
+                        color=layer.color, fontsize=7,
+                        arrowprops=dict(arrowstyle="->", color=layer.color, lw=0.8))
+                if self.var_show_min.get() and len(y_data):
+                    idx_min = int(np.argmin(y_data))
+                    self.ax.annotate(f"MIN {y_data[idx_min]:.3g}",
+                        xy=(x_data[idx_min], y_data[idx_min]),
+                        xytext=(8, -14), textcoords="offset points",
+                        color=layer.color, fontsize=7,
+                        arrowprops=dict(arrowstyle="->", color=layer.color, lw=0.8))
                 continue
 
             # ── Layer normal (CSV) ───────────────────────────────────
